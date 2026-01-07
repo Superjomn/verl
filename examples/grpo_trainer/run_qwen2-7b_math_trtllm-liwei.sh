@@ -17,7 +17,7 @@ PROJECT_NAME=${PROJECT_NAME:-"verl_grpo_example_gsm8k_math"}
 EXP_NAME=trtllm-qwen2-7b-tp${TP}-${NODES}nodes-8gpus${EXP_NAME_SUFFIX:+"-"}${EXP_NAME_SUFFIX}
 
 if [ $TP -eq 4 ]; then
-    MAX_BATCH_SIZE=1024
+    MAX_BATCH_SIZE=256 #1024
 else
     MAX_BATCH_SIZE=384
 fi
@@ -70,10 +70,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=5 \
     actor_rollout_ref.rollout.max_batch_size=${MAX_BATCH_SIZE} \
-    actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
-    +actor_rollout_ref.rollout.engine_kwargs.trtllm.batch_wait_timeout_iters=32 \
-    +actor_rollout_ref.rollout.engine_kwargs.trtllm.batch_wait_max_tokens_ratio=0.5 \
-    actor_rollout_ref.rollout.calculate_log_probs=True \
+    actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \
@@ -88,3 +85,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.resume_mode=disable \
     trainer.total_epochs=15 \
     "${@:2}"
+
+    #actor_rollout_ref.rollout.calculate_log_probs=True \
+    #+actor_rollout_ref.rollout.engine_kwargs.trtllm.batch_wait_timeout_iters=32 \
+    #+actor_rollout_ref.rollout.engine_kwargs.trtllm.batch_wait_max_tokens_ratio=0.5 \
