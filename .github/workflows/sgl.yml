@@ -123,6 +123,8 @@ jobs:
       - name: Test the latest SGLang Rollout async with agent loop
         run: |
           ROLLOUT_NAME=sglang pytest -svvv tests/experimental/agent_loop --retries 3 --retry-delay 5
+        with:
+          max_attempts: 3
 
   cleanup:
     runs-on: ubuntu-latest
