@@ -104,7 +104,7 @@ jobs:
           mode: "create"
           faas-url: "${{ env.DYNAMIC_RUNNER_ENDPOINT }}"
           mlp-image: "${{ env.IMAGE }}"
-          max-attempts: 3
+          max_attempts: 3
 
   e2e_ppo_trainer_fsdp_sglang:
     needs: setup

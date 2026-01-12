@@ -105,6 +105,7 @@ jobs:
           mode: "create"
           faas-url: "${{ env.DYNAMIC_RUNNER_ENDPOINT }}"
           mlp-image: "${{ env.IMAGE }}"
+          max_attempts: 3
 
   e2e_grpo_trainer_fsdp-qwen2:
     needs: setup
