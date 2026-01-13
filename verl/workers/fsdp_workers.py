@@ -16,6 +16,7 @@ The main entry point to run the PPO algorithm
 """
 
 import datetime
+import gc
 import json
 import logging
 import os
@@ -2006,6 +2007,11 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
     async def wake_up(self):
+        print(f"AsyncActorRolloutRefWorker wake_up before gc, rank: {self.rank}, gpu_mem: {torch.cuda.memory_allocated() / 1024**3:.2f} GB, gpu_cache: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"AsyncActorRolloutRefWorker wake_up after gc, rank: {self.rank}, gpu_mem: {torch.cuda.memory_allocated() / 1024**3:.2f} GB, gpu_cache: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+
         await self.rollout_mode()
         return True
 

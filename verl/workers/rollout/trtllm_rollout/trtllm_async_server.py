@@ -13,6 +13,8 @@
 # limitations under the License.
 import asyncio
 import logging
+import gc
+import torch
 import os
 from typing import Any, Optional
 
@@ -183,6 +185,11 @@ class TRTLLMHttpServer:
         return TokenOutput(token_ids=token_ids, log_probs=log_probs)
 
     async def wake_up(self):
+        print(f"TRTLLMHttpServer wake_up, replica_rank: {self.replica_rank}, gpu_mem: {torch.cuda.memory_allocated() / 1024**3:.2f} GB, gpu_cache: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"TRTLLMHttpServer wake_up after gc, replica_rank: {self.replica_rank}, gpu_mem: {torch.cuda.memory_allocated() / 1024**3:.2f} GB, gpu_cache: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+
         if self.rollout_mode == RolloutMode.HYBRID:
             # Call all workers to switch between trainer mode and rollout mode.
             await asyncio.gather(*[worker.wake_up.remote() for worker in self.workers])
