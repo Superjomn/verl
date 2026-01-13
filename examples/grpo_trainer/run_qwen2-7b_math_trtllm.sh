@@ -14,6 +14,7 @@ export RAY_DEDUP_LOGS=0
 TP=${1:-4}
 PROJECT_NAME=${PROJECT_NAME:-"verl_grpo_example_gsm8k_math"}
 EXP_NAME=trtllm-qwen2-7b-tp${TP}-8gpus${EXP_NAME_SUFFIX:+"-"}${EXP_NAME_SUFFIX}
+NODES=${NODES:-1}
 
 if [ $TP -eq 4 ]; then
     MAX_BATCH_SIZE=1024
@@ -81,7 +82,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name=${EXP_NAME} \
     trainer.n_gpus_per_node=8 \
-    trainer.nnodes=1 \
+    trainer.nnodes=${NODES} \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
     trainer.resume_mode=disable \

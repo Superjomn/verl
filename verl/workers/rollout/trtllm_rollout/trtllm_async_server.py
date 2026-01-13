@@ -98,6 +98,8 @@ class TRTLLMHttpServer:
 
     async def launch_server(self):
         from tensorrt_llm import AsyncLLM
+        import tensorrt_llm.logger as trtllm_logger
+        trtllm_logger.set_level('info')
         from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
         from tensorrt_llm.serve import OpenAIServer
 
@@ -134,6 +136,7 @@ class TRTLLMHttpServer:
             "sampler_type": "TRTLLMSampler",
             **engine_kwargs,
         }
+        print(f"llm_kwargs: {llm_kwargs}")
 
         self.llm = await AsyncLLM(**llm_kwargs)
 
