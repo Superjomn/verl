@@ -679,10 +679,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
         aggressive_empty_cache(force_sync=True)
+        timings = {}
 
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
         if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            with Timer(name="load_fsdp_model_to_gpu", logger=None) as timer:
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            timings["load_fsdp_model_to_gpu"] = timer.last
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
         peft_config = None
@@ -720,7 +723,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
         if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            with Timer(name="offload_fsdp_model_to_cpu", logger=None) as timer:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            timings["offload_fsdp_model_to_cpu"] = timer.last
         log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
         set_expandable_segments(False)
@@ -758,6 +763,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # important: need to manually set the random states of each tp to be identical.
         self.torch_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.gen_random_states)
+        return timings
 
     async def trainer_mode(self):
         """Context switch hybridengine to trainer mode."""
@@ -914,10 +920,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        timings = {}
         if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            with Timer(name="load_fsdp_model_to_gpu", logger=None) as timer:
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            timings["load_fsdp_model_to_gpu"] = timer.last
         if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+            with Timer(name="load_fsdp_optimizer", logger=None) as timer:
+                load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+            timings["load_fsdp_optimizer"] = timer.last
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
@@ -942,17 +953,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
             self.actor_lr_scheduler.step()
 
+            metrics.update(timings)
+
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})
 
             output = output.to("cpu")
 
         if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            with Timer(name="offload_fsdp_model_to_cpu", logger=None) as timer:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
+            output.meta_info["metrics"]["offload_fsdp_model_to_cpu"] = timer.last
         if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            with Timer(name="offload_fsdp_optimizer", logger=None) as timer:
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+            output.meta_info["metrics"]["offload_fsdp_optimizer"] = timer.last
 
         return output
 
@@ -976,7 +993,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
             loop = get_event_loop()
-            loop.run_until_complete(self.rollout_mode())
+            timings = loop.run_until_complete(self.rollout_mode())
+            timing_generate.update(timings)
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
@@ -1012,8 +1030,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
         assert self._is_actor
+        timings = {}
         if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            with Timer(name="load_fsdp_model_to_gpu", logger=None) as timer:
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            timings["load_fsdp_model_to_gpu"] = timer.last
 
         # Support all hardwares
         from contextlib import nullcontext
@@ -1044,6 +1065,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
             )
+            output.meta_info["metrics"] = timings
 
         output = output.to("cpu")
 
@@ -1053,8 +1075,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor.actor_module._handle.reshard(True)
 
         if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            with Timer(name="offload_fsdp_model_to_cpu", logger=None) as timer:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
+            output.meta_info["metrics"]["offload_fsdp_model_to_cpu"] = timer.last
 
         return output
 
@@ -1560,8 +1584,11 @@ class CriticWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
     @DistProfiler.annotate(color="cyan", role="compute_values")
     def compute_values(self, data: DataProto):
+        timings = {}
         if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.critic_module)
+            with Timer(name="load_fsdp_model_to_gpu", logger=None) as timer:
+                load_fsdp_model_to_gpu(self.critic_module)
+            timings["load_fsdp_model_to_gpu"] = timer.last
         micro_batch_size = self.config.forward_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         data.meta_info["max_token_len"] = self.config.forward_max_token_len_per_gpu
@@ -1571,19 +1598,27 @@ class CriticWorker(Worker, DistProfilerExtension):
             data = data.to("cpu")  # data will to device with each micro batch on critic.compute_values
             values = self.critic.compute_values(data=data)
             output = DataProto.from_dict(tensors={"values": values})
+            output.meta_info["metrics"] = timings
 
         output = output.to("cpu")
         if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.critic_module)
+            with Timer(name="offload_fsdp_model_to_cpu", logger=None) as timer:
+                offload_fsdp_model_to_cpu(self.critic_module)
+            output.meta_info["metrics"]["offload_fsdp_model_to_cpu"] = timer.last
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
     @DistProfiler.annotate(color="pink", role="critic_update")
     def update_critic(self, data: DataProto):
+        timings = {}
         if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.critic_module)
+            with Timer(name="load_fsdp_model_to_gpu", logger=None) as timer:
+                load_fsdp_model_to_gpu(self.critic_module)
+            timings["load_fsdp_model_to_gpu"] = timer.last
         if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=get_device_id())
+            with Timer(name="load_fsdp_optimizer", logger=None) as timer:
+                load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=get_device_id())
+            timings["load_fsdp_optimizer"] = timer.last
 
         # perform forward computation
         with self.ulysses_sharding_manager:
@@ -1600,12 +1635,18 @@ class CriticWorker(Worker, DistProfilerExtension):
             metrics["critic/lr"] = lr
             self.critic_lr_scheduler.step()
 
+            metrics.update(timings)
+
             output = DataProto(batch=None, meta_info={"metrics": metrics})
 
         if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.critic_module)
+            with Timer(name="offload_fsdp_model_to_cpu", logger=None) as timer:
+                offload_fsdp_model_to_cpu(self.critic_module)
+            output.meta_info["metrics"]["offload_fsdp_model_to_cpu"] = timer.last
         if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.critic_optimizer)
+            with Timer(name="offload_fsdp_optimizer", logger=None) as timer:
+                offload_fsdp_optimizer(optimizer=self.critic_optimizer)
+            output.meta_info["metrics"]["offload_fsdp_optimizer"] = timer.last
 
         output = output.to("cpu")
         return output

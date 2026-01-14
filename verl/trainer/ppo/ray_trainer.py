@@ -1560,6 +1560,8 @@ class RayPPOTrainer:
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
                             metrics.update(old_log_prob_metrics)
+                            if "metrics" in old_log_prob.meta_info:
+                                metrics.update(reduce_metrics(old_log_prob.meta_info["metrics"]))
                             old_log_prob.batch.pop("entropys")
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
@@ -1580,6 +1582,8 @@ class RayPPOTrainer:
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self._compute_values(batch)
+                            if "metrics" in values.meta_info:
+                                metrics.update(reduce_metrics(values.meta_info["metrics"]))
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
