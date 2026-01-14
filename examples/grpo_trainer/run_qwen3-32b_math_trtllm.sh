@@ -36,6 +36,9 @@ MATH_TEST_PATH=${DATADIR}/math/test.parquet
 TRAIN_FILES="['$GSM8K_TRAIN_PATH', '$MATH_TRAIN_PATH']"
 TEST_FILES="['$GSM8K_TEST_PATH', '$MATH_TEST_PATH']"
 
+rollout_n=5
+ppo_macro_batch_size=256
+ppo_micro_batch_size_per_gpu=16
 # -----
 # Launch
 # -----
@@ -54,8 +57,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=128 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_macro_batch_size} \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ppo_micro_batch_size_per_gpu} \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -63,7 +66,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${ppo_micro_batch_size_per_gpu} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${TP} \
     actor_rollout_ref.rollout.name=trtllm \
     actor_rollout_ref.rollout.mode="async" \
