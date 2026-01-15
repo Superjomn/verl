@@ -899,15 +899,8 @@ class AgentLoopManager:
             for replica_rank in range(num_replicas)
         ]
 
-        if self.worker_group and rollout_config.name != "trtllm":
+        if self.worker_group:
             self._run_all([server.init_hybrid(self.worker_group) for server in self.rollout_replicas])
-        elif self.worker_group and rollout_config.name == "trtllm":
-            self._run_all(
-                [
-                    server.init_hybrid_colocated(self.worker_group, rollout_resource_pool)
-                    for server in self.rollout_replicas
-                ]
-            )
         else:
             self._run_all([server.init_standalone() for server in self.rollout_replicas])
 
