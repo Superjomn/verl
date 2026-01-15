@@ -16,9 +16,9 @@ PROJECT_NAME=${PROJECT_NAME:-"verl_grpo_example_gsm8k_math"}
 EXP_NAME=trtllm-qwen2-7b-tp${TP}-8gpus${EXP_NAME_SUFFIX:+"-"}${EXP_NAME_SUFFIX}
 
 if [ $TP -eq 4 ]; then
-    MAX_BATCH_SIZE=1024
+    MAX_NUM_SEQS=1024
 else
-    MAX_BATCH_SIZE=384
+    MAX_NUM_SEQS=384
 fi
 
 # -----
@@ -68,7 +68,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.mode="async" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=5 \
-    actor_rollout_ref.rollout.max_batch_size=${MAX_BATCH_SIZE} \
+    actor_rollout_ref.rollout.max_num_seqs=${MAX_NUM_SEQS} \
     actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
     +actor_rollout_ref.rollout.engine_kwargs.trtllm.batch_wait_timeout_iters=32 \
     +actor_rollout_ref.rollout.engine_kwargs.trtllm.batch_wait_max_tokens_ratio=0.5 \
