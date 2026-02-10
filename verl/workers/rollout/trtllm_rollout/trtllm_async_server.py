@@ -137,7 +137,7 @@ class TRTLLMHttpServer:
             "max_num_tokens": self.config.max_num_batched_tokens,
             "tensor_parallel_size": self.config.tensor_model_parallel_size,
             "pipeline_parallel_size": self.config.pipeline_model_parallel_size,
-            "moe_expert_parallel_size": engine_kwargs.get("moe_expert_parallel_size", 1),
+            "moe_expert_parallel_size": self.config.expert_parallel_size,
             "trust_remote_code": self.model_config.trust_remote_code,
             "placement_groups": self.pgs,
             "placement_bundle_indices": self.bundle_indices,
