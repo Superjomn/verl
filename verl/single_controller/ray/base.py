@@ -631,6 +631,10 @@ class RayWorkerGroup(WorkerGroup):
             "MASTER_ADDR": self._master_addr,
             "MASTER_PORT": self._master_port,
         }
+        # Forward logging env vars if set in the parent process
+        for k in ("VERL_LOGGING_LEVEL",):
+            if k in os.environ:
+                env_vars[k] = os.environ[k]
         if worker_env is not None:
             logging.debug(f"Appending ray class env, origin: {env_vars}, customized env: {worker_env}")
             conflict_env_vars = set(env_vars.keys()) & set(worker_env.keys())
