@@ -457,12 +457,13 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             ), f"Model state dict not found in {state_dict.keys()}. Please check the checkpoint file {local_path}."
             for vpp_rank, model in enumerate(self.model):
                 if len(self.model) == 1:
-                    model_state_dict = state_dict["model"]
+                    model_state_dict = state_dict.pop("model")
                 else:
                     assert f"model{vpp_rank}" in state_dict, f"model{vpp_rank} not found in state_dict"
-                    model_state_dict = state_dict[f"model{vpp_rank}"]
+                    model_state_dict = state_dict.pop(f"model{vpp_rank}")
                 mpu.set_virtual_pipeline_model_parallel_rank(vpp_rank)
                 self.model[vpp_rank].load_state_dict(model_state_dict, strict=self.peft_cls is None)
+            del model_state_dict
             if self.peft_cls is not None:
                 log_with_rank(
                     f"Loaded PEFT adapter checkpoint from {dist_checkpoint_path}", rank=self.rank, logger=logger
@@ -483,26 +484,34 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             assert "optimizer" in state_dict, (
                 f"Optimizer state dict not found in {state_dict.keys()}. Please check the checkpoint file {local_path}."
             )
-            optimizer_state_dict = state_dict["optimizer"]
+            optimizer_state_dict = state_dict.pop("optimizer")
             self.optimizer.load_state_dict(optimizer_state_dict)
+            del optimizer_state_dict
             log_with_rank(f"Loaded optimizer checkpoint from {local_path}", rank=self.rank, logger=logger)
             if self.use_checkpoint_opt_param_scheduler:
                 assert "lr_scheduler" in state_dict, (
                     f"LR scheduler state dict not found in {state_dict.keys()}. Please check the checkpoint file "
                     f"{local_path}."
                 )
-                lr_scheduler_state_dict = state_dict["lr_scheduler"]
+                lr_scheduler_state_dict = state_dict.pop("lr_scheduler")
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
                     log_with_rank(f"Loaded LR scheduler checkpoint from {local_path}", rank=self.rank, logger=logger)
+                del lr_scheduler_state_dict
 
         if self.should_load_extra:
             assert "rng_state" in state_dict, (
                 f"RNG state dict not found in {state_dict.keys()}. Please check the checkpoint file {local_path}."
             )
-            rng_state = state_dict["rng_state"]
+            rng_state = state_dict.pop("rng_state")
             self.load_rng_states(rng_state)
+            del rng_state
             log_with_rank(f"Loaded RNG states from {local_path}", rank=self.rank, logger=logger)
+
+        # Delete remaining state_dict to free all temporary checkpoint data
+        import gc
+        del state_dict
+        gc.collect()
 
         if del_local_after_load:
             try:
