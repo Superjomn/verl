@@ -13,6 +13,7 @@
 # limitations under the License.
 import inspect
 import logging
+import sys
 import os
 import socket
 from copy import deepcopy
@@ -45,15 +46,40 @@ def get_random_string(length: int) -> str:
     return "".join(random.choice(letters_digits) for _ in range(length))
 
 
+def _read_rss_kb():
+    """Read current process RssAnon from /proc/self/status (Linux only)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("RssAnon:"):
+                    return int(line.split()[1])
+    except Exception:
+        pass
+    return 0
+
+
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
     class Functor:
         def __call__(this, *args, **kwargs):
+            import gc
+
             args, kwargs = dispatch_fn(self, *args, **kwargs)
             padding_count = kwargs.pop(_padding_size_key, 0)
             output = execute_fn(method_name, *args, **kwargs)
             if blocking:
                 output = ray.get(output)
+            _rss_before = _read_rss_kb()
             output = collect_fn(self, output)
+            gc.collect()
+            _rss_after = _read_rss_kb()
+            if _rss_after - _rss_before > 1024:  # only log if delta > 1MB
+                print(
+                    f"RAY_EXECUTOR_DEBUG: dispatch {method_name} "
+                    f"collect_delta={_rss_after - _rss_before}kB "
+                    f"rss_after={_rss_after}kB",
+                    file=sys.stderr,
+                    flush=True,
+                )
             if padding_count > 0:
                 if isinstance(output, DataProto):
                     indices = [i for i in range(len(output))][:-padding_count]

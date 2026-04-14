@@ -141,7 +141,22 @@ def _concat_data_proto_or_future(output: list):
     for o in output:
         assert type(o) is type(output[0])
 
-    return BatchData(output).concat()
+    if len(output) <= 1:
+        return output[0] if output else output
+
+    # Incremental concat: absorb one shard at a time to avoid holding all
+    # N shards in memory simultaneously.  With MALLOC_MMAP_THRESHOLD_=65536
+    # each freed shard's mmap pages return to the OS immediately.
+    result = output[0]
+    output[0] = None
+    for i in range(1, len(output)):
+        shard = output[i]
+        output[i] = None  # release reference so OS can reclaim
+        result = BatchData([result, shard]).concat()
+        del shard
+
+    output.clear()
+    return result
 
 
 def dispatch_dp_compute(worker_group, *args, **kwargs):
