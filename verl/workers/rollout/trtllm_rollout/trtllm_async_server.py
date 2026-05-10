@@ -87,7 +87,14 @@ class TRTLLMHttpServer:
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
 
-        if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
+        # Allow dummy load_format outside HYBRID for benchmark/simulator use cases
+        # that need nvfp4 weights without an actual nvfp4 HF checkpoint
+        # (nvfp4 quantization requires load_format=dummy at TRT-LLM init).
+        if (
+            self.rollout_mode != RolloutMode.HYBRID
+            and self.config.load_format == "dummy"
+            and getattr(self.config, "quantization", None) != "nvfp4"
+        ):
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
             self.config.load_format = "auto"
 
