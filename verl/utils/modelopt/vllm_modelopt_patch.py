@@ -551,9 +551,65 @@ def modelopt_process_weights_after_loading(model):
     return dense_count + moe_count
 
 
+# --------------------------------------------------------------------------
+# W4A8 activation simulation patch (Megatron path).
+#
+# Mirrors FSDP's `verl/utils/qat/vllm_patch.py:patched_w4a16_fp8_activation_apply_weights`.
+# Gated on env VERL_W4A8_SIMULATION=1. When set, we wrap
+# ModelOptNvFp4LinearMethod.apply (and ModelOptNvFp4FusedMoE.apply) so the
+# input activation is FP8 quantize→dequantize'd BEFORE the NVFP4-weight GEMM,
+# making the rollout output distribution match what the W4A8 actor was
+# trained on (actor uses modelopt input_quantizer in FP8 mode during fwd).
+# Without this, rollout sees clean BF16 activations → train/rollout mismatch.
+# --------------------------------------------------------------------------
+
+_W4A8_FP8_BLOCK_SIZE = [1, 128]
+_orig_modelopt_dense_apply = None
+_orig_modelopt_moe_apply = None
+
+
+def _fp8_fake_quant_activation(x: torch.Tensor) -> torch.Tensor:
+    """FP8 E4M3 blockwise quant→dequant — STE-style fake-quant for activation.
+
+    Returns a tensor numerically ≈ FP8(x) but in x.dtype. Reuses FSDP's
+    `scaled_fp8_blockwise` kernel from verl/utils/kernel/fp8_kernel.py.
+    """
+    from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
+
+    original_shape = x.shape
+    x_2d = x.view(-1, x.shape[-1]) if x.dim() > 2 else x
+    fp8_data, descale = scaled_fp8_blockwise(x_2d, _W4A8_FP8_BLOCK_SIZE)
+    bm, bn = _W4A8_FP8_BLOCK_SIZE
+    m, n = x_2d.shape
+    n_blocks_m = (m + bm - 1) // bm
+    n_blocks_n = (n + bn - 1) // bn
+    descale_expanded = descale.unsqueeze(-1).unsqueeze(-2)
+    descale_expanded = descale_expanded.expand(n_blocks_m, n_blocks_n, bm, bn)
+    descale_expanded = descale_expanded.reshape(n_blocks_m * bm, n_blocks_n * bn)[:m, :n]
+    return (fp8_data.to(x.dtype) * descale_expanded.to(x.dtype)).view(original_shape)
+
+
+def _modelopt_dense_apply_with_fp8_sim(self, layer, x, bias=None):
+    """Wrap ModelOptNvFp4LinearMethod.apply with optional FP8 input fake-quant."""
+    import os
+
+    if os.environ.get("VERL_W4A8_SIMULATION"):
+        x = _fp8_fake_quant_activation(x)
+    return _orig_modelopt_dense_apply(self, layer, x, bias)
+
+
+def _modelopt_moe_apply_with_fp8_sim(self, layer, x, *args, **kwargs):
+    """Same as dense but for the fused MoE apply path."""
+    import os
+
+    if os.environ.get("VERL_W4A8_SIMULATION"):
+        x = _fp8_fake_quant_activation(x)
+    return _orig_modelopt_moe_apply(self, layer, x, *args, **kwargs)
+
+
 def apply_modelopt_nvfp4_patches():
     """Apply ModelOpt NVFP4 patches to support dynamic weight updates. Call before model loading."""
-    global _patched
+    global _patched, _orig_modelopt_dense_apply, _orig_modelopt_moe_apply
 
     if _patched:
         return
@@ -567,5 +623,11 @@ def apply_modelopt_nvfp4_patches():
     ModelOptNvFp4LinearMethod.process_weights_after_loading = _modelopt_dense_process_weights
     ModelOptNvFp4FusedMoE.process_weights_after_loading = _modelopt_moe_process_weights
     BaseKVCacheMethod.process_weights_after_loading = _modelopt_kv_process_weights
+
+    # W4A8 activation fake-quant — only effective when VERL_W4A8_SIMULATION=1.
+    _orig_modelopt_dense_apply = ModelOptNvFp4LinearMethod.apply
+    ModelOptNvFp4LinearMethod.apply = _modelopt_dense_apply_with_fp8_sim
+    _orig_modelopt_moe_apply = ModelOptNvFp4FusedMoE.apply
+    ModelOptNvFp4FusedMoE.apply = _modelopt_moe_apply_with_fp8_sim
 
     _patched = True
