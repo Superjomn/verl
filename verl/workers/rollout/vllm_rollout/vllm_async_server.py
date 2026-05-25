@@ -789,6 +789,26 @@ class vLLMHttpServer:
             quantization_config_dict = load_quantization_config(qat_config)
             quant_method = quantization_config_dict.get("quant_method", None)
 
+            # vLLM 0.12's ModelOpt integration only accepts quant_algo in
+            # {"FP8", "NVFP4"}. Megatron W4A8 (quant_algo "W4A8_NVFP4_FP8") has
+            # no kernel in vllm 0.12 — fall back to NVFP4 weight pack (W4A16)
+            # for rollout. FP8 activation simulation must be added pre-GEMM
+            # separately (TODO, port from FSDP VERL_W4A8_SIMULATION path).
+            if quantization_config_dict.get("quant_algo") == "W4A8_NVFP4_FP8":
+                quantization_config_dict = dict(quantization_config_dict)
+                quantization_config_dict["quant_algo"] = "NVFP4"
+                cg = dict(quantization_config_dict.get("config_groups", {}))
+                for k, v in cg.items():
+                    v = dict(v)
+                    v.pop("input_activations", None)
+                    cg[k] = v
+                quantization_config_dict["config_groups"] = cg
+                logger.warning(
+                    "vLLM rollout: downgrading quant_algo W4A8_NVFP4_FP8 → NVFP4 "
+                    "(vllm 0.12 modelopt has no W4A8 kernel; FP8 activation sim "
+                    "must be wired separately)."
+                )
+
             if quant_method == "modelopt":
                 from verl.utils.modelopt import apply_modelopt_nvfp4_patches
 

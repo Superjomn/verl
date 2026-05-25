@@ -96,8 +96,14 @@ class QATWeightExporter:
             if meta is None:
                 yield (hf_name, weight)
             else:
-                assert meta.qformat == QUANTIZATION_NVFP4, f"Unsupported qformat: {meta.qformat}"
-                yield from self._quantize_nvfp4(hf_name, weight, meta)
+                # Treat w4a8_nvfp4_fp8 the same as NVFP4 for weight export: the
+                # weight encoding (E2M1 FP4) is identical. FP8 activation info
+                # is dropped here since vLLM rollout falls back to NVFP4 weight
+                # pack (see vllm_async_server._apply_quantization downgrade).
+                if meta.qformat in (QUANTIZATION_NVFP4, "w4a8_nvfp4_fp8"):
+                    yield from self._quantize_nvfp4(hf_name, weight, meta)
+                else:
+                    raise AssertionError(f"Unsupported qformat: {meta.qformat}")
 
     @staticmethod
     def _get_mapping_registry(bridge):
@@ -235,15 +241,22 @@ class QATWeightExporter:
             weights_scaling_factor_2=w_scale_2.to(weight.device),
         )[0]
 
-        quantized = to_quantized_weight(weight, w_scale, meta.qformat, w_scale_2, meta.block_size)
+        # Force NVFP4 export format. For w4a8_nvfp4_fp8 the underlying weight
+        # bits are NVFP4 — activation is FP8 but that's handled separately on
+        # the vLLM side (which currently downgrades to NVFP4-only).
+        quantized = to_quantized_weight(weight, w_scale, QUANTIZATION_NVFP4, w_scale_2, meta.block_size)
 
         yield (name, quantized)
         yield (_derive_scale_name(name, "weight_scale"), w_scale)
         yield (_derive_scale_name(name, "weight_scale_2"), w_scale_2)
 
-        input_scale = _compute_input_scale(meta)
-        if input_scale is not None:
-            yield (_derive_scale_name(name, "input_scale"), input_scale)
+        # Skip input_scale for w4a8 because vLLM rollout uses NVFP4 (no input
+        # activation slot). True FP8 activation simulation must be added
+        # separately (TODO: pre-GEMM injection in vllm linear method).
+        if meta.qformat == QUANTIZATION_NVFP4:
+            input_scale = _compute_input_scale(meta)
+            if input_scale is not None:
+                yield (_derive_scale_name(name, "input_scale"), input_scale)
 
 
 def _iter_hf_to_megatron_matches(registry, hf_name: str):

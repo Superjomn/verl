@@ -30,6 +30,24 @@ _NVFP4_W4A16_QUANTIZER_CFG = {
 }
 
 
+# W4A8: same FP4 E2M1 weights as W4A16, plus FP8 E4M3 input activations.
+# Mirrors FSDP's QATLinear W4A8 mode (FP8 fake-quant on activations during forward).
+_NVFP4_W4A8_QUANTIZER_CFG = {
+    "*weight_quantizer": {
+        "num_bits": (2, 1),
+        "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+        "axis": None,
+        "enable": True,
+    },
+    "*input_quantizer": {
+        "num_bits": (4, 3),       # FP8 E4M3
+        "axis": None,             # per-tensor scaling (modelopt's dynamic FP8 default)
+        "block_sizes": None,
+        "enable": True,
+    },
+}
+
+
 def _ignore_patterns_to_quant_cfg(ignore_patterns: list[str]) -> dict:
     cfg = {}
     mapping = {
@@ -49,9 +67,18 @@ def build_quantize_config(
     qat_mode: str,
     ignore_patterns: list[str] | None = None,
 ) -> dict:
-    """Build a complete ModelOpt quantization config for ``mtq.quantize``."""
-    if qat_mode != "w4a16":
-        raise ValueError(f"Only 'w4a16' is supported, got: {qat_mode}")
+    """Build a complete ModelOpt quantization config for ``mtq.quantize``.
+
+    Supported modes:
+      - ``w4a16``: FP4 (E2M1) weights, no input quantization.
+      - ``w4a8`` : FP4 (E2M1) weights + FP8 (E4M3) input activations.
+    """
+    if qat_mode == "w4a16":
+        base_cfg = _NVFP4_W4A16_QUANTIZER_CFG
+    elif qat_mode == "w4a8":
+        base_cfg = _NVFP4_W4A8_QUANTIZER_CFG
+    else:
+        raise ValueError(f"Unsupported qat_mode: {qat_mode!r}. Use 'w4a16' or 'w4a8'.")
 
     if ignore_patterns is None:
         ignore_patterns = []
@@ -59,7 +86,7 @@ def build_quantize_config(
     ignore_cfg = _ignore_patterns_to_quant_cfg(ignore_patterns)
 
     quant_cfg = {
-        **_NVFP4_W4A16_QUANTIZER_CFG,
+        **base_cfg,
         **_default_disabled_quantizer_cfg,
         **ignore_cfg,
     }

@@ -584,7 +584,13 @@ def _process_nvfp4_moe_marlin(self, layer: torch.nn.Module, is_first_call: bool)
 
 
 def _process_nvfp4_moe_flashinfer_cutlass(self, layer: torch.nn.Module, is_first_call: bool) -> None:
-    """Process MoE layer with FlashInfer/CUTLASS backend (W4A4)."""
+    """Process MoE layer with FlashInfer/CUTLASS backend (W4A4).
+
+    Optimized for repeated calls during verl weight sync:
+    - First call: full format conversion + kernel creation (same as vLLM original)
+    - Subsequent calls: reuse existing buffers, only copy changed data
+      to minimize GPU memory allocations and avoid reserved memory growth.
+    """
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
         convert_to_nvfp4_moe_kernel_format,
         make_nvfp4_moe_kernel,
@@ -602,38 +608,38 @@ def _process_nvfp4_moe_flashinfer_cutlass(self, layer: torch.nn.Module, is_first
         logger.warning("w1_weight_global_scale must match w3_weight_global_scale. Accuracy may be affected.")
     w13_weight_global_scale = layer.w13_weight_global_scale[:, 0].contiguous()
 
-    w13_temp = Parameter(w13_packed.clone(), requires_grad=False)
-    w2_temp = Parameter(w2_packed.clone(), requires_grad=False)
-
     if is_first_call:
+        # First call: do full format conversion (allocates new tensors).
+        # Use clone because convert_to_nvfp4_moe_kernel_format may modify in-place
+        # for some backends (reorder_w1w3_to_w3w1).
+        w13_temp = Parameter(w13_packed.clone(), requires_grad=False)
+        w2_temp = Parameter(w2_packed.clone(), requires_grad=False)
         layer.w13_weight = w13_temp
         layer.w2_weight = w2_temp
 
-    (
-        w13,
-        w13_scale,
-        w13_scale_2,
-        a13_scale,
-        w2,
-        w2_scale,
-        w2_scale_2,
-        a2_scale,
-    ) = convert_to_nvfp4_moe_kernel_format(
-        nvfp4_backend=self.nvfp4_backend,
-        layer=layer,
-        w13=w13_temp,
-        w13_scale=w13_scale_hf,
-        w13_scale_2=(1.0 / w13_weight_global_scale),
-        a13_scale=(1.0 / layer.w13_input_global_scale),
-        w2=w2_temp,
-        w2_scale=w2_scale_hf,
-        w2_scale_2=(1.0 / layer.w2_weight_global_scale),
-        a2_scale=(1.0 / layer.w2_input_global_scale),
-        is_act_and_mul=self.moe.is_act_and_mul,
-    )
+        (
+            w13,
+            w13_scale,
+            w13_scale_2,
+            a13_scale,
+            w2,
+            w2_scale,
+            w2_scale_2,
+            a2_scale,
+        ) = convert_to_nvfp4_moe_kernel_format(
+            nvfp4_backend=self.nvfp4_backend,
+            layer=layer,
+            w13=w13_temp,
+            w13_scale=w13_scale_hf,
+            w13_scale_2=(1.0 / w13_weight_global_scale),
+            a13_scale=(1.0 / layer.w13_input_global_scale),
+            w2=w2_temp,
+            w2_scale=w2_scale_hf,
+            w2_scale_2=(1.0 / layer.w2_weight_global_scale),
+            a2_scale=(1.0 / layer.w2_input_global_scale),
+            is_act_and_mul=self.moe.is_act_and_mul,
+        )
 
-    # Update parameters
-    if is_first_call:
         replace_parameter(layer, "w13_weight", w13)
         replace_parameter(layer, "w2_weight", w2)
         layer.w13_weight_scale = Parameter(w13_scale, requires_grad=False)
@@ -642,42 +648,108 @@ def _process_nvfp4_moe_flashinfer_cutlass(self, layer: torch.nn.Module, is_first
             layer._marlin_tensor_refs = {}
         layer._marlin_tensor_refs["w13_weight_scale"] = layer.w13_weight_scale.data
         layer._marlin_tensor_refs["w2_weight_scale"] = layer.w2_weight_scale.data
+
+        layer.w13_weight_scale_2 = w13_scale_2
+        layer.w2_weight_scale_2 = w2_scale_2
+        layer.w13_input_scale = a13_scale
+        layer.w2_input_scale = a2_scale
+
+        # Create kernel (only once).
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        if self.moe_quant_config is not None and (
+            (not self.moe.moe_parallel_config.use_all2all_kernels) or self.moe.moe_parallel_config.use_naive_all2all_kernels
+        ):
+            self.kernel = make_nvfp4_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                experts_cls=self.experts_cls,
+            )
     else:
-        layer.w13_weight.data.copy_(w13.data)
-        layer.w2_weight.data.copy_(w2.data)
+        # Subsequent calls: re-run format conversion but copy results into
+        # existing buffers to avoid accumulating GPU memory allocations.
+        # We must re-convert because weight values changed from training.
+        # Pass w13_packed directly (no clone) — convert_to_nvfp4_moe_kernel_format
+        # creates new output tensors, it does not modify the input for VLLM_CUTLASS.
+        (
+            w13_new,
+            w13_scale_new,
+            w13_scale_2_new,
+            a13_scale_new,
+            w2_new,
+            w2_scale_new,
+            w2_scale_2_new,
+            a2_scale_new,
+        ) = convert_to_nvfp4_moe_kernel_format(
+            nvfp4_backend=self.nvfp4_backend,
+            layer=layer,
+            w13=w13_packed,
+            w13_scale=w13_scale_hf,
+            w13_scale_2=(1.0 / w13_weight_global_scale),
+            a13_scale=(1.0 / layer.w13_input_global_scale),
+            w2=w2_packed,
+            w2_scale=w2_scale_hf,
+            w2_scale_2=(1.0 / layer.w2_weight_global_scale),
+            a2_scale=(1.0 / layer.w2_input_global_scale),
+            is_act_and_mul=self.moe.is_act_and_mul,
+        )
+
+        # Copy weight data into existing tensors (no new allocation).
+        layer.w13_weight.data.copy_(w13_new.data)
+        layer.w2_weight.data.copy_(w2_new.data)
+
+        # Copy scales into existing refs.
         w13_scale_ref = layer._marlin_tensor_refs.get("w13_weight_scale")
         w2_scale_ref = layer._marlin_tensor_refs.get("w2_weight_scale")
         if w13_scale_ref is not None:
-            w13_scale_ref.copy_(w13_scale)
+            w13_scale_ref.copy_(w13_scale_new)
             layer.w13_weight_scale = Parameter(w13_scale_ref, requires_grad=False)
         else:
-            logger.warning("MoE W4A4: _marlin_tensor_refs['w13_weight_scale'] not found")
-            layer.w13_weight_scale.data.copy_(w13_scale)
+            layer.w13_weight_scale.data.copy_(w13_scale_new)
         if w2_scale_ref is not None:
-            w2_scale_ref.copy_(w2_scale)
+            w2_scale_ref.copy_(w2_scale_new)
             layer.w2_weight_scale = Parameter(w2_scale_ref, requires_grad=False)
         else:
-            logger.warning("MoE W4A4: _marlin_tensor_refs['w2_weight_scale'] not found")
-            layer.w2_weight_scale.data.copy_(w2_scale)
+            layer.w2_weight_scale.data.copy_(w2_scale_new)
 
-    layer.w13_weight_scale_2 = w13_scale_2
-    layer.w2_weight_scale_2 = w2_scale_2
-    layer.w13_input_scale = a13_scale
-    layer.w2_input_scale = a2_scale
+        # Update scalar/small scales in-place (these are tiny, no memory concern).
+        layer.w13_weight_scale_2 = w13_scale_2_new
+        layer.w2_weight_scale_2 = w2_scale_2_new
+        layer.w13_input_scale = a13_scale_new
+        layer.w2_input_scale = a2_scale_new
 
-    # Initialize kernel
-    self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-    if self.moe_quant_config is not None and (
-        (not self.moe.moe_parallel_config.use_all2all_kernels) or self.moe.moe_parallel_config.use_naive_all2all_kernels
-    ):
-        self.kernel = make_nvfp4_moe_kernel(
-            moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-            experts_cls=self.experts_cls,
-        )
+        # Update quant_config so kernel uses new scale values.
+        # CRITICAL for CUDA graph compatibility: We must update tensor VALUES
+        # in-place (via .copy_()) rather than creating new tensor objects.
+        # CUDA graphs capture tensor addresses at graph-capture time. If we
+        # replace quant_config with a new object (new tensors, new addresses),
+        # the captured graph still reads from the OLD addresses → stale/garbage
+        # scale values → garbage output.
+        new_qc = self.get_fused_moe_quant_config(layer)
+        old_qc = self.moe_quant_config
+        if old_qc is not None and new_qc is not None:
+            # In-place copy: preserve tensor addresses for CUDA graph stability
+            for attr in ("g1_alphas", "g2_alphas", "a1_gscale", "a2_gscale",
+                         "w1_scale", "w2_scale"):
+                old_val = getattr(old_qc, attr, None)
+                new_val = getattr(new_qc, attr, None)
+                if old_val is not None and new_val is not None and isinstance(old_val, torch.Tensor):
+                    old_val.copy_(new_val)
+            # moe_quant_config object stays the same (same tensor addresses)
+            del new_qc
+        else:
+            # First time or no old config — just assign (graph not captured yet)
+            self.moe_quant_config = new_qc
+            if hasattr(self, 'kernel') and self.kernel is not None:
+                self.kernel.fused_experts.quant_config = self.moe_quant_config
+
+        # Explicitly free intermediate tensors before processing next layer.
+        del w13_new, w2_new, w13_scale_new, w2_scale_new
+        del w13_scale_2_new, w2_scale_2_new, a13_scale_new, a2_scale_new
 
 
 # MoE NVFP4 Patches (entry points)
+
+
 def patched_nvfp4_moe_process_weights_after_loading(self, layer: torch.nn.Module) -> None:
     """Patched process_weights_after_loading for NVFP4 MoE layer."""
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
@@ -710,6 +782,39 @@ def patched_nvfp4_moe_process_weights_after_loading(self, layer: torch.nn.Module
         delattr(layer, "w2_weight_packed")
 
 
+_original_w4a16_apply_weights = None
+
+
+def patched_w4a16_fp8_activation_apply_weights(self, layer, x, bias=None):
+    """W4A8 simulation: add FP8 activation quant/dequant noise before W4A16 Marlin kernel.
+
+    Enabled via VERL_W4A8_SIMULATION=1 env var (set in W4A8 recipe scripts).
+    When disabled, falls through to original apply_weights.
+    """
+    if not os.environ.get("VERL_W4A8_SIMULATION"):
+        return _original_w4a16_apply_weights(self, layer, x, bias)
+
+    from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
+
+    original_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1])
+
+    block_size = [1, 128]  # per-token, 128-wide blocks
+    fp8_data, descale = scaled_fp8_blockwise(x_2d, block_size)
+
+    # Dequantize back to original dtype
+    bm, bn = block_size
+    m, n = x_2d.shape
+    n_blocks_m = (m + bm - 1) // bm
+    n_blocks_n = (n + bn - 1) // bn
+    descale_expanded = descale.unsqueeze(-1).unsqueeze(-2).expand(n_blocks_m, n_blocks_n, bm, bn)
+    descale_expanded = descale_expanded.reshape(n_blocks_m * bm, n_blocks_n * bn)[:m, :n]
+
+    x_noisy = (fp8_data.to(x.dtype) * descale_expanded.to(x.dtype)).view(original_shape)
+
+    return _original_w4a16_apply_weights(self, layer, x_noisy, bias)
+
+
 _PATCH_TARGETS = [
     # Dense W4A16
     (
@@ -729,6 +834,12 @@ _PATCH_TARGETS = [
         "compressed_tensors_moe.CompressedTensorsW4A4Nvfp4MoEMethod.process_weights_after_loading",
         patched_nvfp4_moe_process_weights_after_loading,
     ),
+    # W4A8 simulation: FP8 activation wrapper around W4A16 apply_weights
+    (
+        "vllm.model_executor.layers.quantization.compressed_tensors.schemes."
+        "compressed_tensors_w4a16_nvfp4.CompressedTensorsW4A16Fp4.apply_weights",
+        patched_w4a16_fp8_activation_apply_weights,
+    ),
 ]
 
 _applied_patches = []
@@ -736,7 +847,7 @@ _applied_patches = []
 
 def apply_qat_patches():
     """Apply NVFP4 patches to support dynamic weight updates. Call before model loading."""
-    global _applied_patches
+    global _applied_patches, _original_w4a16_apply_weights
 
     if _applied_patches:
         logger.warning("QAT patches already applied, skipping")
@@ -744,10 +855,49 @@ def apply_qat_patches():
 
     logger.info("Applying NVFP4 patches for dynamic weight loading...")
 
+    # Save original apply_weights before patching (needed for W4A8 fallthrough)
+    try:
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a16_nvfp4 import (
+            CompressedTensorsW4A16Fp4,
+        )
+        _original_w4a16_apply_weights = CompressedTensorsW4A16Fp4.apply_weights
+    except ImportError:
+        pass
+
     for target, replacement in _PATCH_TARGETS:
         p = patch(target, replacement)
         _applied_patches.append(p)
         p.start()
+
+    # W4A8 simulation: patch MoE forward to add FP8 activation quant/dequant
+    if os.environ.get("VERL_W4A8_SIMULATION"):
+        try:
+            from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+            _original_moe_forward_impl = FusedMoE.forward_impl
+
+            def _moe_fp8_forward_impl(self, hidden_states, router_logits):
+                """W4A8 MoE wrapper: FP8 quant/dequant on hidden_states before MoE GEMM."""
+                from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
+
+                original_shape = hidden_states.shape
+                x_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
+                block_size = [1, 128]
+                fp8_data, descale = scaled_fp8_blockwise(x_2d, block_size)
+
+                bm, bn = block_size
+                m, n = x_2d.shape
+                n_blocks_m = (m + bm - 1) // bm
+                n_blocks_n = (n + bn - 1) // bn
+                descale_exp = descale.unsqueeze(-1).unsqueeze(-2).expand(n_blocks_m, n_blocks_n, bm, bn)
+                descale_exp = descale_exp.reshape(n_blocks_m * bm, n_blocks_n * bn)[:m, :n]
+
+                hidden_states_noisy = (fp8_data.to(hidden_states.dtype) * descale_exp.to(hidden_states.dtype)).view(original_shape)
+                return _original_moe_forward_impl(self, hidden_states_noisy, router_logits)
+
+            FusedMoE.forward_impl = _moe_fp8_forward_impl
+            logger.info("Patched FusedMoE.forward_impl with FP8 activation simulation for W4A8")
+        except ImportError as e:
+            logger.warning(f"Could not patch MoE for W4A8: {e}")
 
     logger.info(f"Applied {len(_applied_patches)} NVFP4 patches for dynamic weight loading")
     return _applied_patches
@@ -810,14 +960,40 @@ def manual_process_weights_after_loading(model):
 
         quant_method = getattr(module, "quant_method", None)
         if quant_method is not None and not hasattr(module, "scheme"):
-            if hasattr(quant_method, "process_weights_after_loading"):
+            # After vLLM's maybe_init_modular_kernel(), quant_method may be
+            # FusedMoEModularMethod which wraps the original quant_method but
+            # does NOT expose process_weights_after_loading.  Unwrap it.
+            actual_qm = quant_method
+            is_wrapped = hasattr(quant_method, "old_quant_method")
+            if is_wrapped:
+                actual_qm = quant_method.old_quant_method
+            if hasattr(actual_qm, "process_weights_after_loading"):
                 # Skip KV cache quantization methods
-                if "KVCache" in quant_method.__class__.__name__:
+                if "KVCache" in actual_qm.__class__.__name__:
                     continue
-                quant_method.process_weights_after_loading(module)
+                actual_qm.process_weights_after_loading(module)
+                # Sync quant_config from unwrapped method back to the wrapper.
+                # The wrapper's fused_experts reads quant_config for scales during
+                # inference; without this sync, stale dummy-weight scales are used.
+                if is_wrapped and hasattr(actual_qm, "moe_quant_config"):
+                    quant_method.moe_quant_config = actual_qm.moe_quant_config
+                    # FusedMoEModularMethod.fused_experts is FusedMoEModularKernel,
+                    # whose .fused_experts is the actual experts impl with quant_config.
+                    if hasattr(quant_method, "fused_experts"):
+                        inner = quant_method.fused_experts
+                        if hasattr(inner, "fused_experts"):
+                            inner.fused_experts.quant_config = actual_qm.moe_quant_config
                 moe_count += 1
 
     logger.debug(f"Processed {dense_count} dense layers, {moe_count} MoE layers")
+
+    # Free the ParamMetaDict that holds references to old HF-format tensors on GPU.
+    # Without this, ~model_size GiB of GPU memory leaks (old params never GC'd),
+    # causing OOM when KV cache is re-allocated for large models (e.g. 30B w4a4).
+    if hasattr(actual_model, "_param_meta_for_restore"):
+        del actual_model._param_meta_for_restore
+        torch.cuda.empty_cache()
+
     return dense_count + moe_count
 
 

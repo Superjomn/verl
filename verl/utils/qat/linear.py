@@ -185,10 +185,46 @@ class STEFP4QuantTriton(torch.autograd.Function):
         return grad_output, None, None
 
 
+class STEFP8Quant(torch.autograd.Function):
+    """Straight-Through Estimator for FP8 blockwise quantization.
+
+    Forward: quantize activation to FP8 E4M3 blockwise, then dequantize back.
+    Backward: pass gradient through unchanged (STE).
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, block_size: list) -> torch.Tensor:
+        from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
+
+        original_shape = x.shape
+        x_2d = x.view(-1, x.shape[-1]) if x.dim() > 2 else x
+
+        fp8_data, descale = scaled_fp8_blockwise(x_2d, block_size)
+
+        # Dequantize: fp8_data is (M, N) in fp8, descale is per-block
+        # descale shape depends on block_size, typically (M/BM, N/BN)
+        bm, bn = block_size
+        m, n = x_2d.shape
+        # Expand descale to match fp8_data shape
+        n_blocks_m = (m + bm - 1) // bm
+        n_blocks_n = (n + bn - 1) // bn
+        descale_expanded = descale.unsqueeze(-1).unsqueeze(-2)  # (n_blocks_m, n_blocks_n, 1, 1)
+        descale_expanded = descale_expanded.expand(n_blocks_m, n_blocks_n, bm, bn)
+        descale_expanded = descale_expanded.reshape(n_blocks_m * bm, n_blocks_n * bn)[:m, :n]
+
+        result = fp8_data.to(x.dtype) * descale_expanded.to(x.dtype)
+        return result.view(original_shape)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple:
+        return grad_output, None
+
+
 class QATMode(str, Enum):
     """QAT quantization mode."""
 
     W4A4 = "w4a4"  # Weight 4-bit, Activation 4-bit (dynamic)
+    W4A8 = "w4a8"  # Weight 4-bit, Activation 8-bit (FP8 simulation)
     W4A16 = "w4a16"  # Weight 4-bit, Activation 16-bit (weight only)
 
 
@@ -230,6 +266,10 @@ class QATLinear(nn.Linear):
 
             self._ema_decay: float = 0.01
 
+        # W4A8: FP8 activation quantization simulation — no persistent scale needed
+        # (FP8 blockwise quantization computes scales on-the-fly)
+        self._w4a8_block_size = [1, 128]  # per-token, 128-wide blocks
+
         self.fake_quant_enabled = True
 
     @classmethod
@@ -268,13 +308,16 @@ class QATLinear(nn.Linear):
         return self.input_amax.item() != self._UNINITIALIZED_SCALE
 
     def _update_input_global_scale(self, x: torch.Tensor):
-        """Update static input_global_scale based on observer strategy."""
+        """Update static input_global_scale based on observer strategy.
+
+        Note: all_reduce is NOT done here because MoE experts with 0 routed
+        tokens skip forward() on some ranks, causing all_reduce to deadlock.
+        Cross-rank synchronization is done separately via sync_qat_input_amax()
+        in core.py, called before weight sync (outside forward, all ranks participate).
+        """
         assert self.mode == QATMode.W4A4, "_update_input_global_scale should only be called in W4A4 mode"
 
         current_amax = torch.amax(torch.abs(x)).detach().to(torch.float32)
-
-        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-            torch.distributed.all_reduce(current_amax, op=torch.distributed.ReduceOp.MAX)
 
         scale_factor = FP8_E4M3_MAX * FP4_E2M1_MAX
 
@@ -363,6 +406,14 @@ class QATLinear(nn.Linear):
         result = STEFP4QuantTriton.apply(x_2d, global_amax, self.group_size)
         return result.view(original_shape)
 
+    def _fake_quantize_activation_fp8(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply FP8 E4M3 blockwise fake quantization to activation (W4A8 mode).
+
+        Uses existing scaled_fp8_blockwise() infrastructure. No persistent
+        global scale needed — FP8 blockwise computes scales on-the-fly.
+        """
+        return STEFP8Quant.apply(x, self._w4a8_block_size)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with fake quantization."""
         if not self.fake_quant_enabled:
@@ -372,6 +423,8 @@ class QATLinear(nn.Linear):
 
         if self.mode == QATMode.W4A4:
             x_fq = self._fake_quantize_activation(x)
+        elif self.mode == QATMode.W4A8:
+            x_fq = self._fake_quantize_activation_fp8(x)
         else:
             x_fq = x
 
