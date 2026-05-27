@@ -25,7 +25,7 @@ import re
 from typing import Generator, Iterable, Optional
 
 import torch
-from compressed_tensors.compressors.quantized_compressors.fp4_quantized import NVFP4PackedCompressor
+from compressed_tensors.compressors.quantized_compressors.nvfp4_quantized import NVFP4PackedCompressor
 from compressed_tensors.quantization.quant_args import (
     FP4_E2M1_DATA,
     FP8_E4M3_DATA,
