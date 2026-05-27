@@ -128,13 +128,22 @@ class QATQuantizer:
         ignore_patterns: Optional[list] = None,
         device: Optional[torch.device] = None,
         param_dtype: Optional[torch.dtype] = None,
+        output_format: str = "vllm",
     ):
         self.mode = mode.lower()
         self._is_w4a4 = self.mode == "w4a4"  # W4A4 needs input_global_scale
+        self._is_w4a8 = self.mode == "w4a8"
         self.group_size = group_size
         self.ignore_patterns = ignore_patterns or ["lm_head", "embed_tokens", "re:.*mlp.gate$"]
         self.device = device or torch.device(get_device_name())
         self.param_dtype = param_dtype
+        if output_format not in ("vllm", "trtllm"):
+            raise ValueError(f"output_format must be 'vllm' or 'trtllm', got {output_format!r}")
+        self.output_format = output_format
+        # TRT-LLM's modelopt loader expects `weight_scale_2` / `input_scale`;
+        # compressed_tensors / vLLM uses `weight_global_scale` / `input_global_scale`.
+        self._weight_gscale_name = "weight_scale_2" if output_format == "trtllm" else "weight_global_scale"
+        self._input_scale_name = "input_scale" if output_format == "trtllm" else "input_global_scale"
 
         self._compressor = NVFP4PackedCompressor()
         self._quant_args = QuantizationArgs(
@@ -236,13 +245,17 @@ class QATQuantizer:
 
             results.append((f"{layer_name}.weight_packed", weight_packed.to(output_device)))
             results.append((f"{layer_name}.weight_scale", weight_scale.to(output_device)))
-            results.append((f"{layer_name}.weight_global_scale", fused_global_scale.to(output_device)))
+            results.append(
+                (f"{layer_name}.{self._weight_gscale_name}", fused_global_scale.to(output_device))
+            )
 
+            # TRT-LLM W4A8 does FP8 activations online (per-token block), so no
+            # static input_scale is emitted. W4A4 (vLLM) needs input_global_scale.
             if self._is_w4a4:
                 if layer_name in input_global_scales:
                     results.append(
                         (
-                            f"{layer_name}.input_global_scale",
+                            f"{layer_name}.{self._input_scale_name}",
                             input_global_scales[layer_name].float().to(output_device),
                         )
                     )
@@ -254,7 +267,7 @@ class QATQuantizer:
                     )
                     results.append(
                         (
-                            f"{layer_name}.input_global_scale",
+                            f"{layer_name}.{self._input_scale_name}",
                             torch.tensor([1.0], dtype=torch.float32).to(output_device),
                         )
                     )
@@ -276,6 +289,8 @@ class QATQuantizer:
             params = params.items()
 
         output_device = target_device or torch.device("cpu")
+        _debug_dump = os.getenv("VERL_QAT_DEBUG_DUMP", "")
+        _debug_layer = 0  # only dump first decoder layer
 
         _sentinel = object()
         current_layer_idx = _sentinel
@@ -299,9 +314,14 @@ class QATQuantizer:
 
             # Layer boundary: flush previous layer
             if layer_idx != current_layer_idx and current_layer_idx is not _sentinel and layer_buffer:
-                yield from self._process_layer_group(
+                for _n, _t in self._process_layer_group(
                     current_layer_idx, layer_buffer, input_global_scales, output_device
-                )
+                ):
+                    if _debug_dump and current_layer_idx == _debug_layer:
+                        logger.warning(
+                            f"[QAT-DUMP fmt={self.output_format}] {_n} shape={tuple(_t.shape)} dtype={_t.dtype}"
+                        )
+                    yield _n, _t
                 layer_buffer = {}
 
             current_layer_idx = layer_idx
@@ -309,7 +329,14 @@ class QATQuantizer:
 
         # Flush last buffered layer
         if layer_buffer:
-            yield from self._process_layer_group(current_layer_idx, layer_buffer, input_global_scales, output_device)
+            for _n, _t in self._process_layer_group(
+                current_layer_idx, layer_buffer, input_global_scales, output_device
+            ):
+                if _debug_dump and current_layer_idx == _debug_layer:
+                    logger.warning(
+                        f"[QAT-DUMP fmt={self.output_format}] {_n} shape={tuple(_t.shape)} dtype={_t.dtype}"
+                    )
+                yield _n, _t
 
         if _igs_uninit_count > 0:
             logger.warning(
