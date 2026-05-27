@@ -15,19 +15,40 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 INFER_BACKEND=${INFER_BACKEND:-vllm}
 ROLLOUT_QUANTIZATION=${ROLLOUT_QUANTIZATION:-}
 
+SMOKE=${SMOKE:-0}
+if [ "${SMOKE}" = 1 ]; then
+    : "${MAX_RESPONSE_LENGTH:=5120}"
+    : "${ROLLOUT_N:=2}"
+    : "${ROLLOUT_MAX_MODEL_LEN:=8192}"
+    : "${ROLLOUT_MAX_NUM_BATCHED_TOKENS:=8192}"
+    : "${TRAIN_BATCH_SIZE:=16}"
+    : "${PPO_MINI_BATCH_SIZE:=8}"
+    : "${TOTAL_EPOCHS:=1}"
+    : "${SAVE_FREQ:=-1}"
+    : "${TEST_FREQ:=-1}"
+    : "${ACTOR_TP:=4}"
+    : "${ACTOR_PP:=1}"
+    : "${ACTOR_EP:=2}"
+    : "${ROLLOUT_TP:=1}"
+    : "${GEN_MOE_TP:=1}"
+    : "${GEN_MOE_EP:=8}"
+    : "${EXPERIMENT_NAME:=qwen3_30b_a3b_${INFER_BACKEND}_megatron${ROLLOUT_QUANTIZATION:+_${ROLLOUT_QUANTIZATION}}_smoke}"
+    export SMOKE
+fi
+
 DATA_DIR=${DATA_DIR:-"$PWD"}
-MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-30B-A3B-Base}
+MODEL_PATH=${MODEL_PATH:-/tmp/models/Qwen3-30B-A3B-Base}
 MCORE_MODEL_PATH=${MCORE_MODEL_PATH:-}
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-${GPUS_PER_NODE:-8}}
 
-train_files=${TRAIN_FILES:-${DAPO_MATH_TRAIN:-${DATA_DIR}/data/DAPO-Math-17k/data/dapo-math-17k.parquet}}
-val_files=${VAL_FILES:-${AIME_VAL:-${DATA_DIR}/data/AIME-2024/data/aime-2024.parquet}}
+train_files=${TRAIN_FILES:-${DAPO_MATH_TRAIN:-/workspace/project/verl/verl-resource/datasets/dapo-math-17k/train.parquet}}
+val_files=${VAL_FILES:-${AIME_VAL:-/workspace/project/verl/verl-resource/datasets/aime-2024/train.parquet}}
 
 train_batch_size=${TRAIN_BATCH_SIZE:-512}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-16}
 max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
-max_response_length=${MAX_RESPONSE_LENGTH:-8192}
+max_response_length=${MAX_RESPONSE_LENGTH:-20480}
 ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-30720}
 
 actor_lr=${ACTOR_LR:-1e-5}
@@ -54,9 +75,9 @@ infer_tp=${INFER_TP:-${rollout_tp}}
 gen_moe_tp=${GEN_MOE_TP:-2}
 gen_moe_ep=${GEN_MOE_EP:-2}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.6}
-rollout_n=${ROLLOUT_N:-8}
-rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-10240}
-rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-10240}
+rollout_n=${ROLLOUT_N:-16}
+rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-22528}
+rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-22528}
 rollout_temperature=${ROLLOUT_TEMPERATURE:-1.0}
 rollout_top_p=${ROLLOUT_TOP_P:-1}
 trtllm_moe_backend=${TRTLLM_MOE_BACKEND:-DEEPGEMM}
@@ -254,6 +275,15 @@ if [ -n "$MCORE_MODEL_PATH" ]; then
 fi
 
 ########################### launch ###########################
+SMOKE_EXTRA=()
+if [ "${SMOKE}" = 1 ]; then
+    smoke_rollout_dp=$(( NGPUS_PER_NODE * NNODES / infer_tp ))
+    SMOKE_EXTRA+=(
+        +trainer.total_training_steps=1
+        actor_rollout_ref.rollout.data_parallel_size=${smoke_rollout_dp}
+    )
+fi
+
 python3 -m verl.trainer.main_ppo \
     "${ALGORITHM[@]}" \
     "${REWARD[@]}" \
@@ -264,4 +294,5 @@ python3 -m verl.trainer.main_ppo \
     "${REF[@]}" \
     "${TRAINER[@]}" \
     "${EXTRA[@]}" \
+    "${SMOKE_EXTRA[@]}" \
     "$@"
