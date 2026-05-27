@@ -858,7 +858,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
             per_tensor_param = quantizer.quantize_with_fusion(
                 per_tensor_param,
-                target_device=torch.device("cpu"),
+                # TRT-LLM rollout reaches tensors via cuda IPC handles; emitting
+                # on CPU would route through rebuild_tensor (5-arg form) instead
+                # of rebuild_cuda_tensor (15-arg form) and TRT-LLM's receiver
+                # hard-codes args[6]=device_id → IndexError.
+                target_device=torch.device(get_device_id()),
             )
             aggressive_empty_cache(force_sync=True)
 
