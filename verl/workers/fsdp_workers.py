@@ -285,9 +285,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
 
     def _init_qat_config(self):
-        """Initialize QAT configuration from actor.qat."""
+        """Initialize QAT configuration from actor.fsdp_config.qat.
+
+        The recipe override path is ``actor.fsdp_config.qat.*`` (FSDPEngineConfig
+        carries the QATEngineConfig field), so we must read from there rather
+        than ``actor.qat`` to pick up user overrides.
+        """
         try:
-            self.qat_config = self.config.actor.qat
+            self.qat_config = self.config.actor.fsdp_config.qat
             self._qat_enabled = self.qat_config.enable
             if self._qat_enabled:
                 logger.info(
