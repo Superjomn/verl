@@ -542,8 +542,17 @@ class ServerAdapter(BaseRollout):
                 )
                 cur_available_bytes -= size_in_bytes
 
-            handle = reduce_tensor(param.detach())
-            cur_handles.append((name, handle))
+            # torch's legacy pickler (_pickle_storage_type) doesn't recognize
+            # float8_e4m3fn storage, so cuda IPC of fp8 tensors blows up at
+            # pickle.dumps. Send them as a uint8 view + a sentinel dtype tag
+            # and restore on the receive side.
+            _param = param.detach()
+            _orig_dtype_tag = None
+            if _param.dtype == torch.float8_e4m3fn:
+                _orig_dtype_tag = "float8_e4m3fn"
+                _param = _param.view(torch.uint8)
+            handle = reduce_tensor(_param)
+            cur_handles.append((name, handle, _orig_dtype_tag))
 
         await flush()
 
