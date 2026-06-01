@@ -142,8 +142,13 @@ class QATQuantizer:
         self.output_format = output_format
         # TRT-LLM's modelopt loader expects `weight_scale_2` / `input_scale`;
         # compressed_tensors / vLLM uses `weight_global_scale` / `input_global_scale`.
+        # TRT-LLM's load_weights_fused_gate_up_helper / vanilla helper looks
+        # for the destination param name `weight` (it's the packed FP4 storage
+        # in module.weight for W4A8); vLLM/compressed_tensors uses
+        # `weight_packed`.
         self._weight_gscale_name = "weight_scale_2" if output_format == "trtllm" else "weight_global_scale"
         self._input_scale_name = "input_scale" if output_format == "trtllm" else "input_global_scale"
+        self._weight_packed_name = "weight" if output_format == "trtllm" else "weight_packed"
 
         self._compressor = NVFP4PackedCompressor()
         self._quant_args = QuantizationArgs(
@@ -221,13 +226,26 @@ class QATQuantizer:
             weight_gpu = tensor.to(device=self.device, dtype=self.param_dtype)
             weights_on_gpu[layer_name] = weight_gpu
             amax = torch.amax(torch.abs(weight_gpu)).to(torch.float32)
-            layer_global_scales[layer_name] = generate_gparam(
-                -amax.unsqueeze(0),
-                amax.unsqueeze(0),
-                scale_data=FP8_E4M3_DATA,
-                quant_data=FP4_E2M1_DATA,
-                dtype=torch.float32,
-            )
+            if self.output_format == "trtllm":
+                # TRT-LLM W4A8 NVFP4 convention (per fp4_fp8_gemm_trtllmgen kernel
+                # and `float_to_e2m1_and_ufp8sf_scale`): the per-tensor global
+                # scale used during weight quantization is FP8_E4M3_MAX / amax
+                # (= 448 / amax). This is 1/E2M1_MAX = 1/6 of compressed_tensors'
+                # `generate_gparam` output (which uses FP8_E4M3_MAX * FP4_E2M1_MAX
+                # / amax = 2688 / amax). Using compressed_tensors' value makes the
+                # FP8 block scales 6x too large → kernel output overflows →
+                # NaN logits → out-of-vocab token sampling on the rollout side.
+                layer_global_scales[layer_name] = (
+                    FP8_E4M3_DATA.max / amax
+                ).reshape([1])
+            else:
+                layer_global_scales[layer_name] = generate_gparam(
+                    -amax.unsqueeze(0),
+                    amax.unsqueeze(0),
+                    scale_data=FP8_E4M3_DATA,
+                    quant_data=FP4_E2M1_DATA,
+                    dtype=torch.float32,
+                )
 
         fused_global_scales = fuse_global_scales(layer_global_scales, strategy="min")
 
@@ -243,11 +261,23 @@ class QATQuantizer:
                 quantization_args=self._quant_args,
             )["weight_packed"]
 
-            results.append((f"{layer_name}.weight_packed", weight_packed.to(output_device)))
+            results.append((f"{layer_name}.{self._weight_packed_name}", weight_packed.to(output_device)))
             results.append((f"{layer_name}.weight_scale", weight_scale.to(output_device)))
-            results.append(
-                (f"{layer_name}.{self._weight_gscale_name}", fused_global_scale.to(output_device))
+            # apply() in TRT-LLM W4A8NVFP4FP8LinearMethod computes
+            #   alpha = module.weight_scale_2 * input_scale
+            # where `input_scale` from quantize_e4m3_per_tensor is the
+            # DEQUANT scale (amax_in/448). For the kernel's
+            # globalScale = b_global_sf / a_global_sf = (amax_in/448) / (448/amax_w),
+            # we need weight_scale_2 = amax_w/448 = 1/fused_global_scale (TRT-LLM convention).
+            # For non-trtllm (vLLM/compressed_tensors), keep the raw QUANT scale.
+            emit_gscale = (
+                1.0 / fused_global_scale if self.output_format == "trtllm"
+                else fused_global_scale
             )
+            results.append(
+                (f"{layer_name}.{self._weight_gscale_name}", emit_gscale.to(output_device))
+            )
+
 
             # TRT-LLM W4A8 does FP8 activations online (per-token block), so no
             # static input_scale is emitted. W4A4 (vLLM) needs input_global_scale.
